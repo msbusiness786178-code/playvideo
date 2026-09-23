@@ -2,24 +2,18 @@
 app.py — PW MPD (MPEG-DASH) Proxy + Player for Render.com
 
 Routes:
-  GET /play?url=<mpd_url>&token=<auth_token>   — watchable player page (main route)
+  GET /play?url=<mpd_url>&token=<auth_token>   — watchable player page
   GET /api/mpd/manifest?url=<mpd>&token=<tok>  — proxied + rewritten MPD manifest
   GET /api/mpd/seg?u=<b64token>                — segment / init / sub-manifest relay
-  GET /api/mpd/key?u=<b64token>                — licence / key relay (DRM-free keys)
+  GET /api/mpd/key?u=<b64token>                — licence / key relay
   GET /health                                  — healthcheck for Render
 
-Usage example:
-  https://playvideo.onrender.com/play?url=https://d1d34p8vz63oiq.cloudfront.net/1b9095a8.../master.mpd&token=eyJhbGciOi...
+URL FORMAT SUPPORTED:
+  /play?url=https://cdn.../master.mpd&parentId=xxx&childId=yyy&videoId=zzz&token=JWT
 
-Design notes:
-  - Token is forwarded as Authorization: Bearer <token> on every upstream
-    request, and also injected as a query-param ?token= where the CDN
-    expects it (CloudFront signed URLs keep the token in the query string).
-  - CORS is fully open (*) so any browser / iframe can load the player.
-  - All MPD XML is rewritten in-flight: every URL (BaseURL, SegmentTemplate,
-    SegmentList, SegmentBase, ContentProtection schemeURI) is routed through
-    /api/mpd/seg so the real CDN URL never reaches client JS.
-  - Segments are streamed in chunks (iter_content) to keep memory low.
+  Extra params like parentId, childId, videoId are forwarded to CDN as-is
+  but do NOT break the MPD URL — we extract `url` and `token` separately
+  and pass everything else through correctly.
 """
 
 import base64
@@ -27,52 +21,49 @@ import logging
 import os
 import re
 import time
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse, unquote
+from urllib.parse import (
+    urljoin, urlparse, parse_qsl, urlencode,
+    urlunparse, unquote, quote
+)
 import xml.etree.ElementTree as ET
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
-# ─── App init ────────────────────────────────────────────────────────────────
+# ─── App ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Constants ───────────────────────────────────────────────────────────────
-UPSTREAM_TIMEOUT   = 20
-UPSTREAM_RETRIES   = 3
-CHUNK_SIZE         = 64 * 1024  # 64 KB streaming chunk
+# ─── Config ─────────────────────────────────────────────────────────────────
+UPSTREAM_TIMEOUT = 25
+UPSTREAM_RETRIES = 4
+CHUNK_SIZE       = 64 * 1024  # 64 KB chunks
 
-# Headers sent to PW CDN — mimics a real Chrome browser on Android
+# Mimic Chrome on Android — PW CDN checks UA
 UPSTREAM_HEADERS = {
-    "User-Agent"      : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Accept"          : "*/*",
-    "Accept-Language" : "en-IN,en;q=0.9",
-    "Referer"         : "https://www.pw.live/",
-    "Origin"          : "https://www.pw.live",
-    "sec-ch-ua"       : '"Chromium";v="124","Google Chrome";v="124"',
-    "sec-ch-ua-mobile": "?1",
-    "sec-ch-ua-platform": '"Android"',
-    "Sec-Fetch-Dest"  : "empty",
-    "Sec-Fetch-Mode"  : "cors",
-    "Sec-Fetch-Site"  : "cross-site",
+    "User-Agent"         : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept"             : "*/*",
+    "Accept-Language"    : "en-IN,en;q=0.9",
+    "Referer"            : "https://www.pw.live/",
+    "Origin"             : "https://www.pw.live",
+    "sec-ch-ua"          : '"Chromium";v="124","Google Chrome";v="124"',
+    "sec-ch-ua-mobile"   : "?1",
+    "sec-ch-ua-platform" : '"Android"',
+    "Sec-Fetch-Dest"     : "empty",
+    "Sec-Fetch-Mode"     : "cors",
+    "Sec-Fetch-Site"     : "cross-site",
+    "Connection"         : "keep-alive",
 }
 
 NO_STORE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
 
-# MPD XML namespaces (standard + PW variants)
-MPD_NS = {
-    "mpd"  : "urn:mpeg:dash:schema:mpd:2011",
-    "cenc" : "urn:mpeg:cenc:2013",
-    "mspr" : "urn:microsoft:playready",
-    "skd"  : "com.apple.streamingkeydelivery",
-}
-ET.register_namespace("", "urn:mpeg:dash:schema:mpd:2011")
-ET.register_namespace("cenc", "urn:mpeg:cenc:2013")
-ET.register_namespace("mspr", "urn:microsoft:playready")
+ET.register_namespace("",      "urn:mpeg:dash:schema:mpd:2011")
+ET.register_namespace("cenc",  "urn:mpeg:cenc:2013")
+ET.register_namespace("mspr",  "urn:microsoft:playready")
 
 
-# ─── CORS — every response ────────────────────────────────────────────────────
+# ─── CORS — every single response ───────────────────────────────────────────
 @app.after_request
 def add_cors(resp):
     resp.headers["Access-Control-Allow-Origin"]   = "*"
@@ -83,14 +74,65 @@ def add_cors(resp):
     resp.headers["Timing-Allow-Origin"]           = "*"
     return resp
 
-
 @app.route("/", methods=["OPTIONS"])
 @app.route("/<path:p>", methods=["OPTIONS"])
 def preflight(p=""):
     return Response("", 204)
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── URL/param extraction helpers ───────────────────────────────────────────
+
+def parse_play_params(raw_qs: str) -> dict:
+    """
+    Safely parse query string where `url` value may contain unencoded
+    `&` characters (e.g. CDN URL pasted raw with &parentId=... appended).
+
+    Strategy:
+      1. Find `url=` marker
+      2. Read everything after it as the raw value
+      3. Find `token=` inside that raw value (if present) — split there
+      4. Everything between url= and token= is the CDN url (may include
+         &parentId=, &childId=, &videoId= — these are forwarded to CDN)
+      5. token= value goes to the end (no other keys after token expected)
+
+    Returns dict with keys: url, token, extra_params
+    """
+    result = {"url": "", "token": "", "extra_params": {}}
+
+    # Find url= position
+    url_marker = "url="
+    url_idx = raw_qs.find(url_marker)
+    if url_idx == -1:
+        return result
+
+    after_url = raw_qs[url_idx + len(url_marker):]
+
+    # Find token= inside the remaining string
+    # token= will appear as either ?token= or &token= AFTER the MPD path
+    # The MPD url ends at .mpd (with possible query string), then &token=
+    token_pattern = re.search(r'[&?]token=', after_url)
+
+    if token_pattern:
+        cdn_raw  = after_url[:token_pattern.start()]
+        tok_raw  = after_url[token_pattern.start() + len(token_pattern.group()):]
+        # token value ends at next & that looks like a new key=value pair
+        # (but token itself is a JWT with no & inside, so just take all)
+        tok_next = re.search(r'&[a-zA-Z_]+=', tok_raw)
+        token    = tok_raw[:tok_next.start()] if tok_next else tok_raw
+        result["token"] = _safe_decode(token)
+    else:
+        cdn_raw = after_url
+
+    result["url"] = _safe_decode(cdn_raw)
+    return result
+
+
+def _safe_decode(s: str) -> str:
+    try:
+        return unquote(s)
+    except Exception:
+        return s
+
 
 def b64e(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
@@ -100,238 +142,177 @@ def b64d(s: str) -> str:
     return base64.urlsafe_b64decode(s).decode()
 
 
-def extract_param(name: str, raw_qs: str = None) -> str | None:
-    """
-    Read a query-param from the raw query string safely.
-    Flask's request.args truncates values at '&' when the value itself
-    contains unencoded '&' (e.g. a CDN-signed URL pasted raw).
-    """
-    qs = raw_qs or request.query_string.decode("utf-8", errors="replace")
-    marker = f"{name}="
-    idx = qs.find(marker)
-    if idx == -1:
-        return None
-    val = qs[idx + len(marker):]
-    # Stop at next key=value boundary only if the next '&' is followed
-    # by a key= pattern — otherwise keep the whole value (e.g. '&IDs&')
-    # We do a greedy read here and let unquote handle it.
-    try:
-        return unquote(val)
-    except Exception:
-        return val
-
-
-def build_auth_headers(token: str | None) -> dict:
-    """Merge UPSTREAM_HEADERS with Authorization if token present."""
+def build_headers(token: str | None) -> dict:
+    """Build upstream headers, injecting auth token if provided."""
     h = dict(UPSTREAM_HEADERS)
     if token:
         h["Authorization"] = f"Bearer {token}"
-        # Some PW CDN endpoints expect the token as a custom header too
-        h["token"]         = token
+        h["token"]         = token      # some PW endpoints check this
         h["authToken"]     = token
     return h
 
 
-def fetch_upstream(url: str, headers: dict, range_hdr: str = None) -> requests.Response:
-    """Fetch with retry + exponential backoff. 4xx = final (no retry)."""
+def clean_mpd_url(raw_url: str) -> tuple[str, dict]:
+    """
+    Split a raw CDN url like:
+      https://cdn.../master.mpd&parentId=xxx&childId=yyy&videoId=zzz
+
+    into:
+      base_url  = https://cdn.../master.mpd
+      extra     = {parentId: xxx, childId: yyy, videoId: zzz}
+
+    The & before parentId is NOT a valid query separator when there's no
+    preceding ? — this is a PW-specific URL format quirk.
+    """
+    # Check if URL has proper query string
+    parsed = urlparse(raw_url)
+
+    if parsed.query:
+        # Normal URL with ? — parse normally
+        return raw_url, {}
+
+    # No ? found — check if there are & params after the path
+    # Pattern: https://cdn.../master.mpd&key=val&key2=val2
+    amp_idx = raw_url.find("&")
+    if amp_idx == -1:
+        return raw_url, {}
+
+    base = raw_url[:amp_idx]
+    rest = raw_url[amp_idx + 1:]
+    extra = dict(parse_qsl(rest, keep_blank_values=True))
+    return base, extra
+
+
+def fetch_upstream(url: str, headers: dict, range_hdr: str = None,
+                   extra_params: dict = None) -> requests.Response:
+    """Fetch with retry + exponential backoff. 4xx = no retry."""
     h = dict(headers)
     if range_hdr:
         h["Range"] = range_hdr
+
+    # Attach extra params (parentId, childId, videoId) to the request
+    params = extra_params or {}
+
     last_exc = None
     for attempt in range(UPSTREAM_RETRIES):
         try:
-            r = requests.get(url, headers=h, timeout=UPSTREAM_TIMEOUT,
-                             allow_redirects=True, stream=True)
-            if r.ok or 400 <= r.status_code < 500:
-                return r
+            r = requests.get(
+                url, headers=h, params=params,
+                timeout=UPSTREAM_TIMEOUT,
+                allow_redirects=True, stream=True
+            )
+            log.info("Upstream %s → %d (attempt %d)", url[:70], r.status_code, attempt + 1)
+            if r.ok or (400 <= r.status_code < 500):
+                return r   # final — no retry on 4xx
             last_exc = requests.RequestException(f"HTTP {r.status_code}")
         except requests.RequestException as exc:
             last_exc = exc
+            log.warning("Upstream error attempt %d: %s", attempt + 1, exc)
+
         wait = 0.5 * (2 ** attempt)
-        log.warning("Attempt %d failed for %s — retrying in %.1fs", attempt + 1, url, wait)
         time.sleep(wait)
+
     raise last_exc
 
 
 def is_mpd(url: str, ctype: str = "") -> bool:
     if "dash" in ctype.lower() or "mpd" in ctype.lower():
         return True
-    path = urlparse(url).path.lower().split("?")[0]
-    return path.endswith(".mpd")
+    return urlparse(url).path.lower().split("?")[0].endswith(".mpd")
 
 
 def is_m3u8(url: str, ctype: str = "") -> bool:
     if "mpegurl" in ctype.lower() or "m3u8" in ctype.lower():
         return True
-    path = urlparse(url).path.lower().split("?")[0]
-    return path.endswith(".m3u8")
+    return urlparse(url).path.lower().split("?")[0].endswith(".m3u8")
 
 
-def make_seg_url(absolute_url: str) -> str:
-    """Wrap a real CDN URL into our /api/mpd/seg?u= proxy URL."""
+def make_seg_proxy(absolute_url: str) -> str:
     base = request.host_url.rstrip("/")
     return f"{base}/api/mpd/seg?u={b64e(absolute_url)}"
 
 
-def rewrite_mpd_manifest(xml_text: str, mpd_base_url: str, token: str | None) -> str:
-    """
-    Parse the MPD XML and rewrite every media URL to point through
-    /api/mpd/seg so:
-      1. The real CDN URL + token never reaches client JS (security).
-      2. CORS issues with CloudFront are eliminated.
-      3. We can inject the auth token on every CDN request server-side.
+# ─── MPD XML rewriter ───────────────────────────────────────────────────────
 
-    Handles:
-      - <BaseURL> elements
-      - SegmentTemplate @media / @initialization / @index attributes
-      - SegmentList > SegmentURL @media / @index attributes
-      - SegmentBase @indexRange stays as-is (byte ranges, not URLs)
+def rewrite_mpd(xml_text: str, mpd_base_url: str, token: str | None) -> str:
+    """
+    Parse MPD XML and rewrite every media/segment URL through /api/mpd/seg
+    so the real CDN URL + token never reaches the browser.
+    Handles: BaseURL, SegmentTemplate, SegmentList>SegmentURL, Initialization.
     """
     try:
-        # Preserve original XML declaration if present
         xml_decl = ""
         if xml_text.lstrip().startswith("<?xml"):
-            xml_decl = xml_text[:xml_text.index("?>") + 2] + "\n"
+            end = xml_text.index("?>") + 2
+            xml_decl = xml_text[:end] + "\n"
 
-        # Strip default namespace to make xpath simpler
+        # Strip default namespace for simpler xpath
         xml_clean = re.sub(r'\sxmlns="[^"]+"', '', xml_text, count=1)
         root = ET.fromstring(xml_clean)
     except ET.ParseError as exc:
         log.error("MPD parse error: %s", exc)
-        return xml_text  # Return unchanged if unparseable
+        return xml_text
 
-    def abs_and_proxy(rel_or_abs: str, context_base: str) -> str:
+    def proxify(rel_or_abs: str, ctx_base: str) -> str:
         if not rel_or_abs or rel_or_abs.startswith("data:"):
             return rel_or_abs
-        absolute = urljoin(context_base, rel_or_abs.strip())
-        # Inject token into query string if it's not already there
-        if token and "token=" not in absolute and "authorization=" not in absolute.lower():
+        absolute = urljoin(ctx_base, rel_or_abs.strip())
+        # Inject token into CDN URL if not already present
+        if token:
             sep = "&" if "?" in absolute else "?"
-            absolute = f"{absolute}{sep}token={token}"
-        return make_seg_url(absolute)
+            if "token=" not in absolute.lower():
+                absolute += f"{sep}token={token}"
+        return make_seg_proxy(absolute)
+
+    def proxify_template(tmpl: str, ctx_base: str) -> str:
+        """Handle SegmentTemplate strings like $Number$.ts or $RepresentationID$/seg$Number$.m4s"""
+        if not tmpl:
+            return tmpl
+        absolute_tmpl = urljoin(ctx_base, tmpl)
+        if token:
+            sep = "&" if "?" in absolute_tmpl else "?"
+            if "token=" not in absolute_tmpl.lower():
+                absolute_tmpl += f"{sep}token={token}"
+        # Encode the full template as base64 so /api/mpd/seg can decode +
+        # substitute $Number$ etc. before fetching from CDN
+        return make_seg_proxy(absolute_tmpl)
 
     current_base = mpd_base_url
 
-    # Walk every element in the tree
     for elem in root.iter():
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
 
-        # <BaseURL>text</BaseURL>
         if tag == "BaseURL" and elem.text and elem.text.strip():
-            original = elem.text.strip()
-            absolute  = urljoin(current_base, original)
-            elem.text = abs_and_proxy(original, current_base)
-            current_base = absolute  # Update context for children
+            orig = elem.text.strip()
+            absolute = urljoin(current_base, orig)
+            elem.text = proxify(orig, current_base)
+            current_base = absolute
 
-        # SegmentTemplate attributes
-        if tag == "SegmentTemplate":
+        elif tag == "SegmentTemplate":
             for attr in ("media", "initialization", "index", "bitstreamSwitching"):
                 val = elem.get(attr)
                 if val:
-                    # SegmentTemplate uses $Number$, $Time$, $RepresentationID$
-                    # — we cannot proxy these directly (they're templates, not
-                    # real URLs yet). Instead we inject a proxy prefix that
-                    # the player will expand BEFORE fetching — BUT since
-                    # most DASH players don't support that, we instead
-                    # rewrite by adding a special marker the /api/mpd/seg
-                    # endpoint will recognise and strip before forwarding.
                     if any(ph in val for ph in ("$Number$", "$Time$", "$Bandwidth$", "$RepresentationID$")):
-                        # Build absolute template first
-                        abs_tmpl = urljoin(current_base, val)
-                        if token and "token=" not in abs_tmpl:
-                            sep = "&" if "?" in abs_tmpl else "?"
-                            abs_tmpl = f"{abs_tmpl}{sep}token={token}"
-                        proxied_tmpl = make_seg_url(abs_tmpl)
-                        # Replace the seg?u= encoded part with a template-aware version
-                        # We encode the template string and let /api/mpd/seg handle it
-                        elem.set(attr, proxied_tmpl)
+                        elem.set(attr, proxify_template(val, current_base))
                     else:
-                        elem.set(attr, abs_and_proxy(val, current_base))
+                        elem.set(attr, proxify(val, current_base))
 
-        # SegmentList > SegmentURL
-        if tag == "SegmentURL":
+        elif tag == "SegmentURL":
             for attr in ("media", "index"):
                 val = elem.get(attr)
                 if val:
-                    elem.set(attr, abs_and_proxy(val, current_base))
+                    elem.set(attr, proxify(val, current_base))
 
-        # SegmentBase (indexRange is a byte range, not a URL — leave alone)
-        # But @initialization is a URL sub-element sometimes
-        if tag == "Initialization":
-            val = elem.get("sourceURL") or elem.get("range")
+        elif tag == "Initialization":
+            val = elem.get("sourceURL")
             if val and not val.replace("-", "").replace(",", "").isdigit():
-                elem.set("sourceURL", abs_and_proxy(val, current_base))
+                elem.set("sourceURL", proxify(val, current_base))
 
     rewritten = ET.tostring(root, encoding="unicode", xml_declaration=False)
     return xml_decl + rewritten
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Routes
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── /play  ─────────────────────────────────────────────────────────────────────
-@app.route("/play")
-def play():
-    """
-    GET /play?url=<mpd_url>&token=<auth_token>
-    Renders the DASH player page. URL and token are read client-side from
-    window.location.search so no server-side escaping needed.
-    """
-    raw_url = extract_param("url")
-    if not raw_url:
-        return render_template("error.html",
-                               message="Missing ?url= parameter. "
-                                       "Usage: /play?url=https://.../master.mpd&token=YOUR_TOKEN"), 400
-    return render_template("player.html")
-
-
-# ── /api/mpd/manifest  ─────────────────────────────────────────────────────────
-@app.route("/api/mpd/manifest")
-def mpd_manifest():
-    """
-    GET /api/mpd/manifest?url=<mpd>&token=<tok>
-    Fetches the MPD from the CDN, rewrites all segment URLs to go through
-    /api/mpd/seg, and returns the rewritten XML.
-    """
-    qs     = request.query_string.decode("utf-8", errors="replace")
-    url    = extract_param("url", qs)
-    token  = extract_param("token", qs)
-
-    if not url:
-        return jsonify({"error": "url param missing"}), 400
-
-    log.info("Fetching MPD: %s (token=%s)", url, "YES" if token else "NO")
-    headers = build_auth_headers(token)
-
-    try:
-        r = fetch_upstream(url, headers)
-    except requests.RequestException as exc:
-        log.error("Upstream error: %s", exc)
-        return jsonify({"error": f"Upstream error: {exc}"}), 502
-
-    if not r.ok:
-        return jsonify({"error": f"CDN returned {r.status_code}"}), r.status_code
-
-    ctype = r.headers.get("content-type", "")
-    body  = r.content.decode("utf-8", errors="replace")
-
-    if is_m3u8(url, ctype):
-        # Fallback: HLS manifest instead of DASH — proxy it through HLS rewriter
-        return _proxy_m3u8(body, url, token)
-
-    rewritten = rewrite_mpd_manifest(body, url, token)
-
-    return Response(
-        rewritten, 200,
-        headers={
-            **NO_STORE,
-            "Content-Type": "application/dash+xml; charset=utf-8",
-        }
-    )
-
-
-def _proxy_m3u8(body: str, base_url: str, token: str | None) -> Response:
+def proxy_m3u8(body: str, base_url: str, token: str | None) -> Response:
     """Minimal HLS rewriter for fallback HLS manifests."""
     out = []
     for line in body.splitlines():
@@ -343,45 +324,117 @@ def _proxy_m3u8(body: str, base_url: str, token: str | None) -> Response:
         if token and "token=" not in absolute:
             sep = "&" if "?" in absolute else "?"
             absolute += f"{sep}token={token}"
-        out.append(make_seg_url(absolute))
+        out.append(make_seg_proxy(absolute))
     return Response(
         "\n".join(out) + "\n", 200,
         headers={**NO_STORE, "Content-Type": "application/vnd.apple.mpegurl"}
     )
 
 
-# ── /api/mpd/seg  ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/play")
+def play():
+    """
+    GET /play?url=MPD_URL&token=JWT
+    Also supports:
+    GET /play?url=https://cdn.../master.mpd&parentId=xxx&childId=yyy&videoId=zzz&token=JWT
+    """
+    raw_qs = request.query_string.decode("utf-8", errors="replace")
+    params = parse_play_params(raw_qs)
+
+    if not params["url"]:
+        return render_template("error.html",
+            message="Missing ?url= parameter. Usage: /play?url=https://.../master.mpd&token=TOKEN"), 400
+
+    return render_template("player.html")
+
+
+@app.route("/api/mpd/manifest")
+def mpd_manifest():
+    """
+    GET /api/mpd/manifest?url=MPD_URL&token=JWT&parentId=...
+    Fetches MPD, rewrites all segment URLs, returns rewritten XML.
+    """
+    raw_qs = request.query_string.decode("utf-8", errors="replace")
+    params = parse_play_params(raw_qs)
+
+    url   = params["url"]
+    token = params["token"]
+
+    if not url:
+        return jsonify({"error": "url param missing"}), 400
+
+    # Split CDN base URL from extra params (parentId, childId, videoId)
+    cdn_url, extra_params = clean_mpd_url(url)
+
+    log.info("Fetching MPD: %s | token=%s | extra=%s",
+             cdn_url[:80], "YES" if token else "NO", extra_params)
+
+    headers = build_headers(token)
+
+    try:
+        r = fetch_upstream(cdn_url, headers, extra_params=extra_params)
+    except requests.RequestException as exc:
+        log.error("MPD upstream error: %s", exc)
+        return jsonify({"error": f"Cannot reach CDN: {exc}"}), 502
+
+    if not r.ok:
+        body_preview = r.text[:300] if r.text else ""
+        log.error("CDN returned %d for %s: %s", r.status_code, cdn_url[:80], body_preview)
+        return jsonify({
+            "error": f"CDN returned HTTP {r.status_code}",
+            "hint": "Token may be expired or URL is wrong",
+            "cdn_url": cdn_url[:120]
+        }), r.status_code
+
+    ctype = r.headers.get("content-type", "")
+    body  = r.content.decode("utf-8", errors="replace")
+
+    if is_m3u8(cdn_url, ctype):
+        return proxy_m3u8(body, cdn_url, token)
+
+    rewritten = rewrite_mpd(body, cdn_url, token)
+    return Response(rewritten, 200, headers={
+        **NO_STORE,
+        "Content-Type": "application/dash+xml; charset=utf-8",
+    })
+
+
 @app.route("/api/mpd/seg")
 def mpd_seg():
     """
     GET /api/mpd/seg?u=<base64url_encoded_cdn_url>
-    Relays any media segment, init segment, or sub-manifest.
-    Streams in 64 KB chunks to keep memory low on Render's free tier.
+    Relay any segment, init segment, or sub-manifest.
+    Streams in 64 KB chunks.
     """
-    token_b64 = request.args.get("u")
-    if not token_b64:
+    tok_b64 = request.args.get("u")
+    if not tok_b64:
         return jsonify({"error": "Missing u param"}), 400
 
     try:
-        cdn_url = b64d(token_b64)
+        cdn_url = b64d(tok_b64)
         parsed  = urlparse(cdn_url)
         if parsed.scheme not in ("http", "https"):
             raise ValueError("Bad scheme")
     except Exception:
         return jsonify({"error": "Invalid segment token"}), 400
 
-    # Extract token from the URL itself (was injected during manifest rewrite)
-    qs_pairs = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    token    = qs_pairs.get("token") or qs_pairs.get("authorization")
+    # Extract token embedded in the URL during rewrite
+    qs_dict = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    token   = qs_dict.get("token") or qs_dict.get("authorization") or qs_dict.get("authToken")
+
+    headers   = build_headers(token)
+    range_hdr = request.headers.get("Range")
 
     log.debug("Seg relay: %s", cdn_url[:80])
-    headers   = build_auth_headers(token)
-    range_hdr = request.headers.get("Range")
 
     try:
         r = fetch_upstream(cdn_url, headers, range_hdr)
     except requests.RequestException as exc:
-        log.error("Seg upstream error for %s: %s", cdn_url[:60], exc)
+        log.error("Seg upstream error: %s", exc)
         return jsonify({"error": f"Upstream error: {exc}"}), 502
 
     if not r.ok:
@@ -389,20 +442,19 @@ def mpd_seg():
 
     ctype = r.headers.get("content-type", "")
 
-    # Sub-manifest (child MPD or HLS playlist) — rewrite before returning
+    # Sub-manifest — rewrite before returning
     if is_mpd(cdn_url, ctype):
         body      = r.content.decode("utf-8", errors="replace")
-        rewritten = rewrite_mpd_manifest(body, cdn_url, token)
+        rewritten = rewrite_mpd(body, cdn_url, token)
         return Response(rewritten, 200, headers={
-            **NO_STORE,
-            "Content-Type": "application/dash+xml; charset=utf-8",
+            **NO_STORE, "Content-Type": "application/dash+xml; charset=utf-8"
         })
 
     if is_m3u8(cdn_url, ctype):
         body = r.content.decode("utf-8", errors="replace")
-        return _proxy_m3u8(body, cdn_url, token)
+        return proxy_m3u8(body, cdn_url, token)
 
-    # Binary segment — stream back in chunks
+    # Binary segment — stream in chunks
     resp_headers = {
         "Content-Type"  : ctype or "video/mp4",
         "Cache-Control" : "public, max-age=30",
@@ -411,7 +463,7 @@ def mpd_seg():
     if r.headers.get("Content-Length"):
         resp_headers["Content-Length"] = r.headers["Content-Length"]
     if r.headers.get("Content-Range"):
-        resp_headers["Content-Range"] = r.headers["Content-Range"]
+        resp_headers["Content-Range"]  = r.headers["Content-Range"]
 
     status = 206 if r.status_code == 206 else 200
 
@@ -421,32 +473,30 @@ def mpd_seg():
                 if chunk:
                     yield chunk
         except Exception as exc:
-            log.error("Streaming error: %s", exc)
+            log.error("Stream chunk error: %s", exc)
 
-    return Response(stream_with_context(generate()), status=status, headers=resp_headers)
+    return Response(
+        stream_with_context(generate()),
+        status=status, headers=resp_headers
+    )
 
 
-# ── /api/mpd/key  ──────────────────────────────────────────────────────────────
 @app.route("/api/mpd/key")
 def mpd_key():
-    """
-    GET /api/mpd/key?u=<b64_key_url>
-    Key/licence relay for clearkey or key-only (non-Widevine) content.
-    Binary relay with proper CORS so the browser's EME can fetch keys.
-    """
-    token_b64 = request.args.get("u")
-    if not token_b64:
+    """GET /api/mpd/key?u=<b64_key_url> — Key/licence relay."""
+    tok_b64 = request.args.get("u")
+    if not tok_b64:
         return jsonify({"error": "Missing u param"}), 400
     try:
-        key_url = b64d(token_b64)
+        key_url = b64d(tok_b64)
         if urlparse(key_url).scheme not in ("http", "https"):
             raise ValueError
     except Exception:
         return jsonify({"error": "Invalid key token"}), 400
 
-    qs_pairs = dict(parse_qsl(urlparse(key_url).query, keep_blank_values=True))
-    token    = qs_pairs.get("token")
-    headers  = build_auth_headers(token)
+    qs_dict = dict(parse_qsl(urlparse(key_url).query, keep_blank_values=True))
+    token   = qs_dict.get("token")
+    headers = build_headers(token)
 
     try:
         r = fetch_upstream(key_url, headers)
@@ -459,19 +509,16 @@ def mpd_key():
     })
 
 
-# ── /health  ───────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "playvideo-mpd-proxy"})
 
 
-# ── Root redirect  ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-# ─── Dev server ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
