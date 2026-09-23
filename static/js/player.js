@@ -2,136 +2,183 @@
     "use strict";
 
     /* ── DOM ── */
-    var video       = document.getElementById("video");
-    var shell       = document.getElementById("shell");
-    var statusBox   = document.getElementById("status");
-    var statusText  = document.getElementById("statusText");
-    var errDetail   = document.getElementById("errDetail");
-    var qualBadge   = document.getElementById("qualBadge");
-    var elapsedBadge= document.getElementById("elapsedBadge");
-    var qualBtn     = document.getElementById("qualBtn");
-    var qualPanel   = document.getElementById("qualPanel");
-    var qualList    = document.getElementById("qualList");
-    var goLiveBtn   = document.getElementById("goLiveBtn");
-    var fsBtn       = document.getElementById("fsBtn");
+    var video        = document.getElementById("video");
+    var shell        = document.getElementById("shell");
+    var statusBox    = document.getElementById("status");
+    var statusText   = document.getElementById("statusText");
+    var errDetail    = document.getElementById("errDetail");
+    var qualBadge    = document.getElementById("qualBadge");
+    var elapsedBadge = document.getElementById("elapsedBadge");
+    var qualBtn      = document.getElementById("qualBtn");
+    var qualPanel    = document.getElementById("qualPanel");
+    var qualList     = document.getElementById("qualList");
+    var goLiveBtn    = document.getElementById("goLiveBtn");
+    var fsBtn        = document.getElementById("fsBtn");
 
-    /* ── Read ?url= and ?token= from the page URL ── */
-    var qs      = window.location.search;
-    var rawUrl  = getParam(qs, "url");
-    var token   = getParam(qs, "token");
+    /* ────────────────────────────────────────────────────────────────────
+       Read ?url= and ?token= from the page URL.
 
-    function getParam(search, name) {
-        var marker = name + "=";
-        var idx    = search.indexOf(marker);
+       Problem: The user may paste a URL like:
+         /play?url=https://cdn.../master.mpd&parentId=xxx&childId=yyy&token=JWT
+
+       Standard URLSearchParams.get("url") would only return
+       "https://cdn.../master.mpd" (stops at first &) — dropping parentId etc.
+
+       We need the FULL url value INCLUDING &parentId=... up until &token=.
+       Then we pass everything verbatim to /api/mpd/manifest which handles
+       the correct splitting server-side.
+
+       Strategy:
+         1. Read raw window.location.search
+         2. Extract everything after `url=` as rawUrl
+         3. Extract token from `token=` (last param)
+         4. Build manifest URL = /api/mpd/manifest?url=<rawUrl>&token=<token>
+            where rawUrl is re-encoded properly
+    ─────────────────────────────────────────────────────────────────────── */
+
+    var rawSearch = window.location.search; // e.g. ?url=https://...mpd&parentId=xxx&token=JWT
+
+    function extractRawParam(search, name) {
+        var marker = (search.indexOf("?") === 0 ? "" : "") + name + "=";
+        // Search from after the ? 
+        var haystack = search.indexOf("?") === 0 ? search.slice(1) : search;
+        var idx = haystack.indexOf(marker);
         if (idx === -1) return "";
-        var raw = search.slice(idx + marker.length);
-        try { return decodeURIComponent(raw); } catch(e) { return raw; }
+        return haystack.slice(idx + marker.length);
     }
+
+    function parsePlayerParams(search) {
+        // Remove leading ?
+        var qs = search.indexOf("?") === 0 ? search.slice(1) : search;
+
+        var urlMarker   = "url=";
+        var tokenMarker = "token=";
+
+        var urlIdx   = qs.indexOf(urlMarker);
+        var tokenIdx = qs.lastIndexOf(tokenMarker); // token is usually last
+
+        if (urlIdx === -1) return { url: "", token: "" };
+
+        var afterUrl = qs.slice(urlIdx + urlMarker.length);
+
+        // Find &token= inside afterUrl
+        var tokenInUrl = afterUrl.match(/[&?]token=/);
+        var rawUrl, rawToken;
+
+        if (tokenInUrl) {
+            rawUrl   = afterUrl.slice(0, tokenInUrl.index);
+            rawToken = afterUrl.slice(tokenInUrl.index + tokenInUrl[0].length);
+            // Token ends at next & followed by key=
+            var nextKey = rawToken.match(/&[a-zA-Z_]+=./);
+            if (nextKey) rawToken = rawToken.slice(0, nextKey.index);
+        } else if (tokenIdx !== -1 && tokenIdx > urlIdx) {
+            // token= is a separate top-level param
+            rawUrl   = qs.slice(urlIdx + urlMarker.length, tokenIdx > 0 ? qs.lastIndexOf("&token=") : qs.length);
+            rawToken = qs.slice(tokenIdx + tokenMarker.length);
+        } else {
+            rawUrl   = afterUrl;
+            rawToken = "";
+        }
+
+        var safeUrl = rawUrl;
+        var safeToken = rawToken;
+        try { safeUrl   = decodeURIComponent(rawUrl);   } catch(e) {}
+        try { safeToken = decodeURIComponent(rawToken); } catch(e) {}
+
+        return { url: safeUrl, token: safeToken };
+    }
+
+    var params = parsePlayerParams(rawSearch);
+    var rawUrl = params.url;
+    var token  = params.token;
 
     /* ── Status helpers ── */
     function showLoading(msg) {
-        statusBox.className  = "status";
-        statusBox.style.display = "flex";
-        statusText.textContent  = msg || "Loading...";
-        errDetail.textContent   = "";
+        statusBox.className       = "status";
+        statusBox.style.display   = "flex";
+        statusText.textContent    = msg || "Loading...";
+        errDetail.textContent     = "";
     }
     function showError(msg, detail) {
-        statusBox.className  = "status error";
-        statusBox.style.display = "flex";
-        statusText.textContent  = "✕ " + msg;
-        errDetail.textContent   = detail || "";
+        statusBox.className       = "status error";
+        statusBox.style.display   = "flex";
+        statusText.textContent    = "✕ " + msg;
+        errDetail.textContent     = detail || "";
     }
     function hideStatus() {
         statusBox.style.display = "none";
     }
 
-    /* ── Time formatter ── */
     function fmt(s) {
         s = Math.floor(s || 0);
-        var h = Math.floor(s / 3600);
-        var m = Math.floor((s % 3600) / 60);
+        var h   = Math.floor(s / 3600);
+        var m   = Math.floor((s % 3600) / 60);
         var sec = s % 60;
         return (h ? h + ":" : "") +
                String(m).padStart(2, "0") + ":" +
                String(sec).padStart(2, "0");
     }
 
-    /* ── Guard: url required ── */
     if (!rawUrl) {
-        showError(
-            "URL missing!",
-            "Usage: /play?url=https://.../master.mpd&token=YOUR_TOKEN"
-        );
+        showError("URL missing!", "Usage: /play?url=https://.../master.mpd&token=YOUR_TOKEN");
         return;
     }
 
-    /* ── Build the manifest URL (routed through our proxy) ── */
-    var origin    = window.location.origin;
-    var manifUrl  = origin + "/api/mpd/manifest?url=" +
-                    encodeURIComponent(rawUrl) +
-                    (token ? "&token=" + encodeURIComponent(token) : "");
+    /* ── Build manifest proxy URL ──
+       We send the raw url + token to the server. Server does the proper
+       splitting of CDN url vs extra params (parentId, childId, videoId). ── */
+    var manifUrl = window.location.origin +
+                   "/api/mpd/manifest?url=" + encodeURIComponent(rawUrl) +
+                   (token ? "&token=" + encodeURIComponent(token) : "");
 
     showLoading("Initialising player...");
 
-    /* ═════════════════════════════════════════════════════════════════════
-       Shaka Player setup
-       ═════════════════════════════════════════════════════════════════════ */
-    var player = null;
+    /* ═══════════════════════════════════════════════════════════════════
+       Shaka Player
+    ═══════════════════════════════════════════════════════════════════ */
+    var player  = null;
     var tracks  = [];
     var started = false;
     var elapsedInterval = null;
 
-    /* Install built-in polyfills (EME, fetch, etc.) */
     shaka.polyfill.installAll();
 
     if (!shaka.Player.isBrowserSupported()) {
-        showError(
-            "Browser not supported",
-            "Please use Chrome, Edge, or Firefox."
-        );
+        showError("Browser not supported", "Please use Chrome, Edge, or Firefox.");
         return;
     }
 
     player = new shaka.Player(video);
 
-    /* ── Network request filter — inject auth token on every CDN request
-          that goes through our proxy (the proxy already handles this, but
-          this also covers any requests Shaka issues directly, e.g. EME
-          license requests if ever needed) ── */
+    /* Network filter — inject auth on any direct request Shaka makes */
     player.getNetworkingEngine().registerRequestFilter(function (type, req) {
         if (token) {
             req.headers["Authorization"] = "Bearer " + token;
         }
-        // Ensure CORS credentials not sent (our proxy is open)
         req.allowCrossSiteCredentials = false;
     });
 
-    /* ── Shaka configuration ── */
+    /* Shaka config */
     player.configure({
         streaming: {
-            lowLatencyMode        : false,
-            rebufferingGoal       : 3,
-            bufferingGoal         : 30,
-            bufferBehind          : 60,
-            retryParameters: {
-                maxAttempts         : 5,
-                baseDelay           : 500,
-                backoffFactor       : 1.5,
-                fuzzFactor          : 0.5,
-                timeout             : 20000,
+            lowLatencyMode  : false,
+            rebufferingGoal : 3,
+            bufferingGoal   : 30,
+            bufferBehind    : 60,
+            retryParameters : {
+                maxAttempts : 5,
+                baseDelay   : 1000,
+                backoffFactor: 1.5,
+                fuzzFactor  : 0.5,
+                timeout     : 30000,
             },
-            // Prefer higher quality automatically
-            useNativeHlsOnSafari  : false,
         },
         abr: {
-            enabled               : true,
-            defaultBandwidthEstimate: 2000000, // start at 2 Mbps
-            switchInterval        : 8,         // seconds between ABR switches
-            bandwidthUpgradeTarget: 0.85,
+            enabled                 : true,
+            defaultBandwidthEstimate: 2000000,
+            switchInterval          : 8,
+            bandwidthUpgradeTarget  : 0.85,
             bandwidthDowngradeTarget: 0.95,
-            restrictions: {
-                minHeight           : 360,
-            },
         },
         manifest: {
             dash: {
@@ -139,11 +186,11 @@
                 autoCorrectDrift    : true,
             },
             retryParameters: {
-                maxAttempts         : 5,
-                baseDelay           : 500,
-                backoffFactor       : 1.5,
-                fuzzFactor          : 0.5,
-                timeout             : 20000,
+                maxAttempts : 5,
+                baseDelay   : 1000,
+                backoffFactor: 1.5,
+                fuzzFactor  : 0.5,
+                timeout     : 30000,
             },
         },
     });
@@ -152,40 +199,35 @@
     player.addEventListener("error", function (evt) {
         var err  = evt.detail;
         var code = err && err.code ? err.code : "?";
-        var cat  = err && err.category ? err.category : "?";
         console.error("Shaka error", err);
 
-        var msg    = "Playback error (code " + code + ")";
+        var msg = "Playback error (code " + code + ")";
         var detail = "";
 
         if (code === 1001 || code === 1002) {
-            msg    = "Network error — stream unreachable";
-            detail = "CDN link may have expired or your connection dropped.";
+            msg    = "Network error — CDN unreachable";
+            detail = "Link may have expired, or server is waking up (Render free tier cold start). Try refreshing in 30s.";
         } else if (code === 1003) {
-            msg    = "Timeout fetching stream";
-            detail = "Server is too slow or the URL is invalid.";
+            msg    = "Request timed out";
+            detail = "CDN is too slow or URL is invalid.";
         } else if (code === 2000 || code === 2006) {
-            msg    = "Manifest error — cannot parse MPD";
-            detail = "The MPD URL may be wrong or the CDN returned an error.";
+            msg    = "Cannot parse manifest";
+            detail = "MPD URL may be wrong or CDN returned an error page.";
         } else if (code === 4001) {
-            msg    = "DRM / key error";
-            detail = "Token may be expired or DRM licence unavailable.";
-        } else if (code === 3000 || code === 3001) {
-            msg    = "Decryption failed";
-            detail = "Token is invalid or the content is Widevine-protected.";
+            msg    = "DRM / Key error";
+            detail = "Token expired or content requires Widevine (not supported in free proxy).";
         }
 
         showError(msg, detail);
     });
 
-    /* ── Adaptation (quality change) ── */
-    player.addEventListener("adaptation", updateQualBadge);
+    player.addEventListener("adaptation",    updateQualBadge);
     player.addEventListener("trackschanged", function () {
         buildQualityMenu();
         updateQualBadge();
     });
 
-    /* ── Load the manifest ── */
+    /* ── Load ── */
     showLoading("Fetching manifest...");
 
     player.load(manifUrl)
@@ -199,15 +241,14 @@
             attemptAutoplay();
         })
         .catch(function (err) {
-            console.error("Load failed", err);
+            console.error("Shaka load failed", err);
             var code = err && err.code ? err.code : "?";
             showError(
                 "Failed to load stream",
-                "Error code: " + code + ". Check the URL/token and try again."
+                "Code: " + code + ". Check URL/token. If Render just woke up, try refreshing."
             );
         });
 
-    /* ── Autoplay ── */
     function attemptAutoplay() {
         video.play().catch(function () {
             video.muted = true;
@@ -216,19 +257,11 @@
     }
 
     /* ── Video events ── */
-    video.addEventListener("playing", function () {
-        if (started) hideStatus();
-    });
-    video.addEventListener("waiting", function () {
-        if (started) showLoading("Buffering...");
-    });
-    video.addEventListener("stalled", function () {
-        if (started) showLoading("Stalled — reconnecting...");
-    });
-    video.addEventListener("error", function () {
-        showError("Video element error — try refreshing.");
-    });
-    video.addEventListener("click", function () {
+    video.addEventListener("playing", function () { if (started) hideStatus(); });
+    video.addEventListener("waiting", function () { if (started) showLoading("Buffering..."); });
+    video.addEventListener("stalled", function () { if (started) showLoading("Stalled — reconnecting..."); });
+    video.addEventListener("error",   function () { showError("Video element error — try refreshing."); });
+    video.addEventListener("click",   function () {
         video.muted = false;
         if (video.paused) video.play().catch(function(){});
         else video.pause();
@@ -251,10 +284,8 @@
         try {
             tracks = player.getVariantTracks();
             tracks.sort(function(a,b){ return (b.height||0) - (a.height||0); });
-
             qualList.innerHTML = "";
 
-            // Auto option
             var autoEl = document.createElement("div");
             autoEl.className = "q-item" + (player.getConfiguration().abr.enabled ? " active" : "");
             autoEl.innerHTML = '<span class="q-dot"></span>Auto (ABR)';
@@ -294,7 +325,7 @@
         try {
             var active = player.getVariantTracks().find(function(t){ return t.active; });
             for (var i = 1; i < items.length; i++) {
-                items[i].classList.toggle("active", !abrOn && tracks[i-1] && tracks[i-1].id === (active && active.id));
+                items[i].classList.toggle("active", !abrOn && tracks[i-1] && active && tracks[i-1].id === active.id);
             }
         } catch(e) {}
     }
@@ -306,23 +337,22 @@
         qualPanel.classList.toggle("open");
     });
     document.addEventListener("click", function() { closeQualPanel(); });
-    qualPanel.addEventListener("click", function(e){ e.stopPropagation(); });
+    qualPanel.addEventListener("click", function(e) { e.stopPropagation(); });
 
-    /* ── Elapsed timer + "Go Live" ── */
+    /* ── Elapsed + Go Live ── */
     function startElapsedTimer() {
         if (elapsedInterval) return;
         elapsedBadge.classList.add("show");
         elapsedInterval = setInterval(function () {
             try {
-                var prs = player.getStats();
-                if (prs && typeof prs.playTime === "number") {
-                    elapsedBadge.textContent = fmt(prs.playTime);
+                var st = player.getStats();
+                if (st && typeof st.playTime === "number") {
+                    elapsedBadge.textContent = fmt(st.playTime);
                 } else if (!video.paused) {
                     elapsedBadge.textContent = fmt(video.currentTime);
                 }
             } catch(e) {}
 
-            // "Go Live" button: show if user is >10s behind live edge
             try {
                 var seekRange = player.seekRange();
                 if (seekRange && seekRange.end > 0) {
@@ -343,11 +373,9 @@
         } catch(e) {}
     });
 
-    /* ── Fullscreen + landscape lock ── */
+    /* ── Fullscreen ── */
     fsBtn.addEventListener("click", function () {
-        var req = shell.requestFullscreen  ||
-                  shell.webkitRequestFullscreen ||
-                  shell.mozRequestFullScreen;
+        var req = shell.requestFullscreen || shell.webkitRequestFullscreen || shell.mozRequestFullScreen;
         if (req) {
             var p = req.call(shell);
             var lock = function() {
@@ -364,10 +392,7 @@
 
     document.addEventListener("fullscreenchange", function () {
         if (!document.fullscreenElement) {
-            try {
-                if (screen.orientation && screen.orientation.unlock)
-                    screen.orientation.unlock();
-            } catch(e) {}
+            try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch(e) {}
             fsBtn.textContent = "⛶";
         } else {
             fsBtn.textContent = "✕";
@@ -377,32 +402,16 @@
     /* ── Keyboard shortcuts ── */
     document.addEventListener("keydown", function(e) {
         switch(e.key) {
-            case " ":
-            case "k":
+            case " ": case "k":
                 e.preventDefault();
-                if (video.paused) video.play().catch(function(){});
-                else video.pause();
+                if (video.paused) video.play().catch(function(){}); else video.pause();
                 break;
-            case "f":
-            case "F":
-                fsBtn.click();
-                break;
-            case "ArrowRight":
-                video.currentTime = Math.min(video.currentTime + 10, video.duration || Infinity);
-                break;
-            case "ArrowLeft":
-                video.currentTime = Math.max(video.currentTime - 10, 0);
-                break;
-            case "ArrowUp":
-                video.volume = Math.min(video.volume + 0.1, 1);
-                break;
-            case "ArrowDown":
-                video.volume = Math.max(video.volume - 0.1, 0);
-                break;
-            case "m":
-            case "M":
-                video.muted = !video.muted;
-                break;
+            case "f": case "F": fsBtn.click(); break;
+            case "ArrowRight": video.currentTime = Math.min(video.currentTime + 10, video.duration || Infinity); break;
+            case "ArrowLeft":  video.currentTime = Math.max(video.currentTime - 10, 0); break;
+            case "ArrowUp":    video.volume = Math.min(video.volume + 0.1, 1); break;
+            case "ArrowDown":  video.volume = Math.max(video.volume - 0.1, 0); break;
+            case "m": case "M": video.muted = !video.muted; break;
         }
     });
 
