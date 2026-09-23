@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: playvideo
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8000"
+    healthCheckPath: /health
+    autoDeploy: true
