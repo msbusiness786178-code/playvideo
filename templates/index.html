@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PlayVideo — MPD Stream Player</title>
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    min-height: 100vh;
+    background: #0a0a0a;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+}
+.card {
+    background: #141414;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px;
+    padding: 40px 36px;
+    max-width: 560px; width: 100%;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+}
+h1 { font-size: 26px; font-weight: 800; color: #fff; margin-bottom: 6px; }
+h1 span { color: #ff6600; }
+.sub { color: rgba(255,255,255,0.4); font-size: 13px; margin-bottom: 32px; }
+label { display: block; font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.5); margin-bottom: 6px; letter-spacing: 0.5px; text-transform: uppercase; }
+input {
+    width: 100%; padding: 12px 14px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; color: #fff; font-size: 13px;
+    outline: none; transition: border 0.15s;
+    margin-bottom: 16px;
+}
+input:focus { border-color: #ff6600; }
+input::placeholder { color: rgba(255,255,255,0.25); }
+button {
+    width: 100%; padding: 13px;
+    background: #ff6600; color: #fff;
+    border: none; border-radius: 8px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+    transition: background 0.15s;
+}
+button:hover { background: #e55a00; }
+.info {
+    margin-top: 28px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.4);
+    line-height: 1.7;
+}
+.info code {
+    font-family: "SF Mono", "Fira Code", monospace;
+    background: rgba(255,255,255,0.07);
+    padding: 1px 5px; border-radius: 4px;
+    color: rgba(255,150,80,0.9); font-size: 11px;
+}
+.divider { border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 22px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+    <h1>Play<span>Video</span> 📺</h1>
+    <p class="sub">Physics Wallah · MPD/DASH Stream Player</p>
+
+    <label>MPD / Stream URL</label>
+    <input type="url" id="urlInput" placeholder="https://d1d34p8vz63oiq.cloudfront.net/.../master.mpd">
+
+    <label>Auth Token <span style="color:rgba(255,255,255,0.2);font-weight:400;text-transform:none">(required for PW streams)</span></label>
+    <input type="text" id="tokenInput" placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...">
+
+    <button onclick="play()">▶ Play Stream</button>
+
+    <hr class="divider">
+    <div class="info">
+        <strong style="color:rgba(255,255,255,0.6)">Direct URL usage:</strong><br>
+        <code>/play?url=MPD_URL&amp;token=AUTH_TOKEN</code><br><br>
+        The player proxies all segments through this server — CORS is fully handled. Token is injected on every CDN request automatically.
+    </div>
+</div>
+<script>
+function play() {
+    var url   = document.getElementById("urlInput").value.trim();
+    var token = document.getElementById("tokenInput").value.trim();
+    if (!url) { alert("Please enter a stream URL."); return; }
+    var dest = "/play?url=" + encodeURIComponent(url) + (token ? "&token=" + encodeURIComponent(token) : "");
+    window.open(dest, "_blank");
+}
+document.getElementById("urlInput").addEventListener("keydown", function(e){ if(e.key==="Enter") play(); });
+document.getElementById("tokenInput").addEventListener("keydown", function(e){ if(e.key==="Enter") play(); });
+</script>
+</body>
+</html>
